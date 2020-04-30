@@ -36,6 +36,7 @@ class KeeloqStates():
     state_bit = None
     state_byte = None
     state_portion =None
+    last_period_samples = 0
     bit_count = 0
     byte_count = 0
     next_byte = 0
@@ -126,6 +127,10 @@ class Decoder(srd.Decoder):
         self.wait({0: 'f' if self.options['polarity'] == 'active-low' else 'r'})
         self.first_samplenum = self.samplenum
 
+        encoded = ""
+        serialBin = 0
+        buttonBin = 0
+
         # Keep getting samples for the period's middle and terminal edges.
         # At the same time that last sample starts the next period.
         while True:
@@ -145,42 +150,33 @@ class Decoder(srd.Decoder):
             period = self.samplenum - start_samplenum
             duty = end_samplenum - start_samplenum
             ratio = float(duty / period)
-
-            # Report the duty cycle in percent.
-            percent = float(ratio * 100)
-
             # Report the period in units of time.
             period_t = float(period / self.samplerate)
+            duty_t = float(duty / self.samplerate)
 
             # Report the duty cycle in the binary output.
-            if period_t <= 0.0015 and period_t >= 0.001 : #skip over Preamble and Header
+            if (period_t >= 0.001 and period_t <= 0.0012):  #skip over Preamble and Header, allow last bit
                 #logger.error("KLQ: setting state_bit = READ")
                 keeloq_states.state_bit = "READ"
+            elif keeloq_states.bit_count > 64 and duty_t < 0.0009 and keeloq_states.state_bit == 'READ':
+                keeloq_states.state_bit = "FINISH"
             else:
-                #logger.error("KLQ: setting state_bit = FINISH or START")
-                keeloq_states.state_bit = ("FINISH" if keeloq_states.state_bit == "READ" else "START")
-               
-            # ----------- state_bit --------------
-            if keeloq_states.state_bit == "START":
-                #logger.error("KLQ: state_bit == START")
-                keeloq_states.next_byte = 0
-                keeloq_states.bit_count = 0
-                keeloq_states.byte_count = 0
-                keeloq_states.bit = 0
-                keeloq_states.bit_position = self.samplenum
-                keeloq_states.byte_position = self.samplenum
-                keeloq_states.portion_position = self.samplenum
-                encoded = ""
-                serialBin = 0
+                keeloq_states.state_bit = "START"
 
-            elif keeloq_states.state_bit == "READ":
+            if keeloq_states.state_bit == "READ" or keeloq_states.state_bit == "FINISH":
                 #logger.error("KLQ: state_bit == READ")
                 keeloq_states.bit_count = keeloq_states.bit_count + 1
-                keeloq_states.bit = (0 if percent >= 50 else 1)
+                keeloq_states.bit = (0 if duty_t >= 0.0006 else 1)
                 binary_s = str(keeloq_states.bit)
+                if keeloq_states.state_bit == "FINISH":
+                    logger.error("keeloq_states.state_bit == FINISH")
+                    self.es_block = keeloq_states.bit_position + keeloq_states.last_period_samples
                 self.put_bit(binary_s)
-                keeloq_states.bit_position = self.samplenum
-                keeloq_states.next_byte = keeloq_states.next_byte | (keeloq_states.bit << (keeloq_states.bit_count % 8))
+                if keeloq_states.state_bit == "READ":
+                    keeloq_states.bit_position = self.samplenum #next bit starts here
+                    keeloq_states.last_period_samples = period
+                #logger.error("last_period_samples " + str(period))
+                keeloq_states.next_byte = (keeloq_states.next_byte >> 1) | (keeloq_states.bit << 7)
                 #logger.error("KLQ: keeloq_states.bit_count % 8: " + str(keeloq_states.bit_count % 8))
                 if keeloq_states.bit_count % 8 == 0 :
                     keeloq_states.state_byte = "FINISH"
@@ -206,7 +202,7 @@ class Decoder(srd.Decoder):
                     encoded = hex_byte + encoded
                 keeloq_states.next_byte = 0
                 if keeloq_states.bit_count == 32:
-                    self.put_portion("crypted: " + encoded)
+                    self.put_portion("crypted: 0x" + encoded)
                     logger.error("crypted: " + encoded)
                     keeloq_states.portion_position = self.samplenum
                 keeloq_states.state_portion = "SKIP"
@@ -216,13 +212,35 @@ class Decoder(srd.Decoder):
                 #logger.error("KLQ: state_portion read serial bit_count:" + str(keeloq_states.bit_count))
                 serialBin = serialBin | (keeloq_states.bit << (keeloq_states.bit_count - 33))
             if keeloq_states.bit_count == 60:
-                serial = "serial: " + "{:02X}".format(serialBin)
+                serial = "serial: " + "0x{:02X}".format(serialBin)
                 logger.error(serial)
                 self.put_portion(serial)
                 keeloq_states.portion_position = self.samplenum
+                
+            
+            #4 bit button status
+            if keeloq_states.bit_count > 60 and keeloq_states.bit_count <= 64:
+                #logger.error("KLQ: state_portion read serial bit_count:" + str(keeloq_states.bit_count))
+                buttonBin = buttonBin | (keeloq_states.bit << (keeloq_states.bit_count - 61))
+            if keeloq_states.bit_count == 64:
+                button = "button: " + "0x{:1X}".format(buttonBin)
+                logger.error(button)
+                self.put_portion(button)
+                keeloq_states.portion_position = self.samplenum
+            # ----------- state_bit --------------
 
-            # Update and report the new duty cycle average.
-            num_cycles += 1
-            average += percent
-            self.put(self.first_samplenum, self.es_block, self.out_average,
-                     float(average / num_cycles))
+            if keeloq_states.state_bit == "START" or keeloq_states.state_bit == "FINISH":
+                #logger.error("KLQ: state_bit == START")
+                keeloq_states.next_byte = 0
+                keeloq_states.bit_count = 0
+                keeloq_states.byte_count = 0
+                keeloq_states.bit = 0
+                keeloq_states.bit_position = self.samplenum
+                keeloq_states.byte_position = self.samplenum
+                keeloq_states.portion_position = self.samplenum
+                keeloq_states.last_period_samples = 0;
+                encoded = ""
+                serialBin = 0
+                buttonBin = 0
+
+                
